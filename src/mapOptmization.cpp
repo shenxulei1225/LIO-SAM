@@ -496,11 +496,6 @@ public:
 
 
 
-
-
-
-
-
     void loopClosureThread()
     {
         if (loopClosureEnableFlag == false)
@@ -533,12 +528,16 @@ public:
             return;
 
         mtx.lock();
+        //关键帧的位置 
         *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
+        //关键帧的位姿
         *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
         mtx.unlock();
 
         // find keys
+        // 当前关键帧
         int loopKeyCur;
+        // 历史关键帧 
         int loopKeyPre;
         if (detectLoopClosureExternal(&loopKeyCur, &loopKeyPre) == false)
             if (detectLoopClosureDistance(&loopKeyCur, &loopKeyPre) == false)
@@ -550,6 +549,9 @@ public:
         {
             loopFindNearKeyframes(cureKeyframeCloud, loopKeyCur, 0);
             loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum);
+
+            // 回环帧把自己周围一些点云取出来，也就是构成一个帧局部地图的一个匹配问题
+            // historyKeyframeSearchNum 25帧
             if (cureKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
                 return;
             if (pubHistoryKeyFrames->get_subscription_count() != 0)
@@ -558,10 +560,15 @@ public:
 
         // ICP Settings
         static pcl::IterativeClosestPoint<PointType, PointType> icp;
+        // 设置最大相关距离
         icp.setMaxCorrespondenceDistance(historyKeyframeSearchRadius*2);
+        // 最大优化次数
         icp.setMaximumIterations(100);
+        //TransformationEpsilon 表示ICP算法中变换矩阵的收敛阈值
         icp.setTransformationEpsilon(1e-6);
+        // EuclideanFitnessEpsilon 表示ICP算法中目标点云和源点云之间的欧式距离的收敛阈值
         icp.setEuclideanFitnessEpsilon(1e-6);
+        // RANSAC 迭代次数
         icp.setRANSACIterations(0);
 
         // Align clouds
@@ -569,7 +576,8 @@ public:
         icp.setInputTarget(prevKeyframeCloud);
         pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
         icp.align(*unused_result);
-
+        
+        // 检测icp是否收敛 或 得分满足要求
         if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore)
             return;
 
@@ -584,27 +592,40 @@ public:
         // Get pose transformation
         float x, y, z, roll, pitch, yaw;
         Eigen::Affine3f correctionLidarFrame;
+
+        // 把修正后的当前点云发布供可视化使用
         correctionLidarFrame = icp.getFinalTransformation();
-        // transform from world origin to wrong pose
+
+        // transform from world origin to wrong pose  取出当前帧的位姿
         Eigen::Affine3f tWrong = pclPointToAffine3f(copy_cloudKeyPoses6D->points[loopKeyCur]);
-        // transform from world origin to corrected pose
+
+        // transform from world origin to corrected pose   将icp结果补偿过去，就是当前帧的更为准确的位姿结果
         Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;// pre-multiplying -> successive rotation about a fixed frame
+        
+        // 将当前帧补偿后的位姿 转换成 平移和旋转
         pcl::getTranslationAndEulerAngles (tCorrect, x, y, z, roll, pitch, yaw);
+
+        /* 将当前帧补偿后的位姿 转换成 gtsam的形式
+         * From 和 To相当于帧间约束的因子
+         * To是历史回环帧的位姿
+         */
         gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
         gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
         gtsam::Vector Vector6(6);
+
+        // 使用icp的得分作为他们的约束噪声项
         float noiseScore = icp.getFitnessScore();
         Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
         noiseModel::Diagonal::shared_ptr constraintNoise = noiseModel::Diagonal::Variances(Vector6);
 
-        // Add pose constraint
+        // Add pose constraint 使用icp的得分作为他们的约束噪声项
         mtx.lock();
         loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
         loopPoseQueue.push_back(poseFrom.between(poseTo));
         loopNoiseQueue.push_back(constraintNoise);
         mtx.unlock();
 
-        // add loop constriant
+        // add loop constriant 将两帧索引，两帧相对位姿和噪声作为回环约束 送入对列
         loopIndexContainer[loopKeyCur] = loopKeyPre;
     }
 
@@ -622,10 +643,14 @@ public:
         std::vector<int> pointSearchIndLoop;
         std::vector<float> pointSearchSqDisLoop;
         kdtreeHistoryKeyPoses->setInputCloud(copy_cloudKeyPoses3D);
+        // 只包含关键帧位移信息的点云填充kdtree
         kdtreeHistoryKeyPoses->radiusSearch(copy_cloudKeyPoses3D->back(), historyKeyframeSearchRadius, pointSearchIndLoop, pointSearchSqDisLoop, 0);
         
         for (int i = 0; i < (int)pointSearchIndLoop.size(); ++i)
         {
+          /*历史帧，必须比当前帧间隔30s以上,必须满足时间上超过一定阈值，才认为是一个有效的回环
+           * historyKeyframeSearchTimeDiff 时间阈值 30s
+           */
             int id = pointSearchIndLoop[i];
             if (abs(copy_cloudKeyPoses6D->points[id].time - timeLaserInfoCur) > historyKeyframeSearchTimeDiff)
             {
@@ -633,7 +658,7 @@ public:
                 break;
             }
         }
-
+        // 如果没有找到回环或者回环找到自己身上去了，就认为是本次回环寻找失败
         if (loopKeyPre == -1 || loopKeyCur == loopKeyPre)
             return false;
 
@@ -702,11 +727,13 @@ public:
         // extract near keyframes
         nearKeyframes->clear();
         int cloudSize = copy_cloudKeyPoses6D->size();
+        // searchNum 是搜索范围 ，遍历帧的范围
         for (int i = -searchNum; i <= searchNum; ++i)
         {
             int keyNear = key + i;
             if (keyNear < 0 || keyNear >= cloudSize )
                 continue;
+            // 把对应角点和面点的点云转到世界坐标系下去
             *nearKeyframes += *transformPointCloud(cornerCloudKeyFrames[keyNear], &copy_cloudKeyPoses6D->points[keyNear]);
             *nearKeyframes += *transformPointCloud(surfCloudKeyFrames[keyNear],   &copy_cloudKeyPoses6D->points[keyNear]);
         }
